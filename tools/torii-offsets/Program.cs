@@ -36,6 +36,83 @@ internal static class Program
 
     private static readonly List<string> ReportLines = new();
 
+    /// <summary>Set once measurement starts; lets the crash handler still save
+    /// whatever was computed instead of losing the whole run.</summary>
+    private static (string OutFile, string ReportFile, string Version,
+        Dictionary<string, List<string>> Manifest,
+        Dictionary<string, ClassResult> Results)? PartialState;
+
+    private static void WritePartialOutputOnCrash(object? sender, UnhandledExceptionEventArgs e)
+    {
+        try
+        {
+            if (PartialState == null) return;
+
+            var (outFile, reportFile, version, manifest, results) = PartialState.Value;
+
+            ReportLines.Add("");
+            ReportLines.Add($"PARTIAL OUTPUT — the tool crashed: {e.ExceptionObject}");
+            WriteOffsetsJson(outFile, version, manifest, results);
+            File.WriteAllLines(reportFile, ReportLines);
+
+            Console.Error.WriteLine();
+            Console.Error.WriteLine($"CRASH — partial offsets were still written to:");
+            Console.Error.WriteLine($"  {outFile}");
+            Console.Error.WriteLine($"  {reportFile}");
+            Console.Error.WriteLine("Attach the report when asking for help.");
+        }
+        catch
+        {
+            // best effort on a dying process
+        }
+    }
+
+    /// <summary>
+    /// Allocates an object without running any constructor, and suppresses its
+    /// finalizer. The suppression matters: these objects are all-null inside, so
+    /// a finalizer like Skin's dereferences null and takes the whole process
+    /// down with an unhandled exception on the finalizer thread.
+    /// </summary>
+    private static object AllocUninitialized(Type type)
+    {
+        object obj = RuntimeHelpers.GetUninitializedObject(type);
+        GC.SuppressFinalize(obj);
+        return obj;
+    }
+
+    /// <summary>
+    /// Concrete stand-ins for the generic collection interfaces, which have no
+    /// instantiable implementation among the game's own loaded types
+    /// (e.g. IEnumerable&lt;APIMod&gt;, IReadOnlyList&lt;InputHandler&gt;).
+    /// </summary>
+    private static Type? MakeCollectionSubstitute(Type ft)
+    {
+        if (!ft.IsGenericType) return null;
+
+        var def = ft.GetGenericTypeDefinition();
+        var args = ft.GetGenericArguments();
+
+        Type? open;
+        if (def == typeof(IEnumerable<>) || def == typeof(IReadOnlyCollection<>) ||
+            def == typeof(IReadOnlyList<>) || def == typeof(ICollection<>) || def == typeof(IList<>))
+            open = typeof(List<>);
+        else if (def == typeof(IDictionary<,>) || def == typeof(IReadOnlyDictionary<,>))
+            open = typeof(Dictionary<,>);
+        else
+            return null;
+
+        if (open.GetGenericArguments().Length != args.Length) return null;
+
+        try
+        {
+            return open.MakeGenericType(args);
+        }
+        catch
+        {
+            return null; // variant/unbound generic args
+        }
+    }
+
     private sealed class ClassResult
     {
         public Dictionary<string, int> Offsets = new();
@@ -122,7 +199,14 @@ internal static class Program
         Console.WriteLine($"Loaded {loadedAssemblies} assemblies ({failedAssemblies} failed/skipped), {typeMap.Count} types");
         Console.WriteLine();
 
+        Directory.CreateDirectory(outDir);
+        string outFile = Path.Combine(outDir, $"{version}.json");
+        string reportFile = Path.Combine(outDir, $"{version}.report.txt");
+
         var results = new Dictionary<string, ClassResult>();
+        PartialState = (outFile, reportFile, version, manifest, results);
+        AppDomain.CurrentDomain.UnhandledException += WritePartialOutputOnCrash;
+
         int fieldsOk = 0, fieldsMissing = 0, classesMissing = 0;
 
         foreach (var (className, fieldNames) in manifest)
@@ -173,8 +257,6 @@ internal static class Program
             return 1;
         }
 
-        Directory.CreateDirectory(outDir);
-        string outFile = Path.Combine(outDir, $"{version}.json");
         WriteOffsetsJson(outFile, version, manifest, results);
         Console.WriteLine();
         Console.WriteLine($"Wrote {outFile}");
@@ -185,7 +267,6 @@ internal static class Program
 
         ReportLines.Add("");
         ReportLines.Add($"Fields resolved: {fieldsOk}, missing: {fieldsMissing}, classes missing: {classesMissing}");
-        string reportFile = Path.Combine(outDir, $"{version}.report.txt");
         File.WriteAllLines(reportFile, ReportLines);
         Console.WriteLine($"Report (per-class warnings) written to {reportFile} — attach it when asking for help.");
 
@@ -421,7 +502,7 @@ internal static class Program
         // the object is bump-allocated between them, so copying ScanWindow bytes
         // from its base cannot run off the end of the heap segment.
         var guardBefore = new byte[64];
-        object obj = RuntimeHelpers.GetUninitializedObject(measurementType);
+        object obj = AllocUninitialized(measurementType);
         var guardAfter = new byte[ScanWindow];
 
         // Reused snapshot buffers: allocating a fresh 16 KiB array per field
@@ -554,7 +635,7 @@ internal static class Program
         try
         {
             // works for abstract classes too — only truly unlayoutable types throw
-            RuntimeHelpers.GetUninitializedObject(type);
+            AllocUninitialized(type);
             return true;
         }
         catch
@@ -590,7 +671,7 @@ internal static class Program
         {
             try
             {
-                return RuntimeHelpers.GetUninitializedObject(ft);
+                return AllocUninitialized(ft);
             }
             catch
             {
@@ -604,7 +685,7 @@ internal static class Program
         // just as unique for the pointer search.
         var substitute = FindSubstitute(ft);
         if (substitute != null)
-            return RuntimeHelpers.GetUninitializedObject(substitute);
+            return AllocUninitialized(substitute);
 
         throw new InvalidOperationException(
             $"no instantiable substitute loaded for {ft.FullName}");
@@ -619,6 +700,23 @@ internal static class Program
     {
         if (SubstituteCache.TryGetValue(ft, out var cached))
             return cached;
+
+        // generic collection interfaces first — their concrete implementations
+        // live in the BCL, not among the loaded game types
+        var collection = MakeCollectionSubstitute(ft);
+        if (collection != null)
+        {
+            try
+            {
+                AllocUninitialized(collection); // probe
+                SubstituteCache[ft] = collection;
+                return collection;
+            }
+            catch
+            {
+                // fall through to the type scan
+            }
+        }
 
         Type? best = null;
         string wanted = ft.IsInterface && ft.Name.Length > 1 && ft.Name[0] == 'I'
@@ -635,7 +733,7 @@ internal static class Program
 
             try
             {
-                RuntimeHelpers.GetUninitializedObject(candidate); // probe
+                AllocUninitialized(candidate); // probe
             }
             catch
             {
@@ -658,11 +756,11 @@ internal static class Program
     private static object MakeRandomValue(Type ft, int depth)
     {
         if (depth > 4)
-            return RuntimeHelpers.GetUninitializedObject(ft);
+            return AllocUninitialized(ft);
 
         if (ft.IsEnum)
         {
-            object e = RuntimeHelpers.GetUninitializedObject(ft);
+            object e = AllocUninitialized(ft);
             var underlying = ft.GetField("value__", DeclaredInstanceFields);
             if (underlying != null)
                 underlying.SetValue(e, MakeRandomValue(underlying.FieldType, depth + 1));
@@ -688,7 +786,7 @@ internal static class Program
 
             // composite struct (Vector2, DateTime, decimal, Nullable<T>, ...):
             // fill every declared field with non-zero random data
-            object boxed = RuntimeHelpers.GetUninitializedObject(ft);
+            object boxed = AllocUninitialized(ft);
             foreach (var sub in ft.GetFields(DeclaredInstanceFields))
             {
                 if (sub.IsLiteral || sub.IsStatic) continue;
