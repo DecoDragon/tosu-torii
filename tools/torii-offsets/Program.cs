@@ -28,6 +28,14 @@ internal static class Program
 
     private static readonly Random Rng = new(0x70721);
 
+    /// <summary>All types loaded from the install dir — used to find concrete
+    /// substitutes for interface/abstract/uninstantiable field types.</summary>
+    private static readonly List<Type> AllTypes = new();
+
+    private static readonly Dictionary<Type, Type?> SubstituteCache = new();
+
+    private static readonly List<string> ReportLines = new();
+
     private sealed class ClassResult
     {
         public Dictionary<string, int> Offsets = new();
@@ -110,6 +118,7 @@ internal static class Program
         Console.WriteLine();
 
         var typeMap = LoadTypes(toriiPath, out int loadedAssemblies, out int failedAssemblies);
+        AllTypes.AddRange(typeMap.Values);
         Console.WriteLine($"Loaded {loadedAssemblies} assemblies ({failedAssemblies} failed/skipped), {typeMap.Count} types");
         Console.WriteLine();
 
@@ -147,8 +156,12 @@ internal static class Program
 
             string status = gcRetryFailed ? "[FAIL ]" : ok == fieldNames.Count ? "[ ok  ]" : "[part ]";
             Console.WriteLine($"{status} {className} — {ok}/{fieldNames.Count} fields");
+            ReportLines.Add($"{status} {className} — {ok}/{fieldNames.Count} fields");
             foreach (var w in result.Warnings)
+            {
                 Console.WriteLine($"         ! {w}");
+                ReportLines.Add($"         ! {w}");
+            }
         }
 
         Console.WriteLine();
@@ -169,6 +182,12 @@ internal static class Program
         Console.WriteLine($"  <tosu folder>/torii-offsets/{version}.json");
         Console.WriteLine($"  <tosu cache>/torii/{version}.json");
         Console.WriteLine($"or set TOSU_TORII_OFFSETS to the file (or its folder).");
+
+        ReportLines.Add("");
+        ReportLines.Add($"Fields resolved: {fieldsOk}, missing: {fieldsMissing}, classes missing: {classesMissing}");
+        string reportFile = Path.Combine(outDir, $"{version}.report.txt");
+        File.WriteAllLines(reportFile, ReportLines);
+        Console.WriteLine($"Report (per-class warnings) written to {reportFile} — attach it when asking for help.");
 
         PrintInternalsProbe(typeMap);
 
@@ -377,11 +396,32 @@ internal static class Program
         gcMoved = false;
         var result = new ClassResult();
 
+        // Some types (interfaces, or abstract types whose layout fails to
+        // realize in this tool's context, e.g. osu.Framework Storage) cannot be
+        // allocated directly. Measure on a concrete derived type instead: the
+        // CLR guarantees fields declared on a base class sit at identical
+        // offsets inside derived instances.
+        Type measurementType = type;
+        if (type.IsInterface || !CanInstantiate(type))
+        {
+            var substitute = FindSubstitute(type);
+            if (substitute == null)
+            {
+                result.Warnings.Add(
+                    $"cannot allocate {type.FullName} and no concrete derived type was found — class skipped");
+                return result;
+            }
+
+            measurementType = substitute;
+            result.Warnings.Add(
+                $"allocated as substitute {substitute.FullName} — offsets of {type.FullName} fields are identical in derived instances");
+        }
+
         // Guards keep the scan window inside our own committed allocations:
         // the object is bump-allocated between them, so copying ScanWindow bytes
         // from its base cannot run off the end of the heap segment.
         var guardBefore = new byte[64];
-        object obj = RuntimeHelpers.GetUninitializedObject(type);
+        object obj = RuntimeHelpers.GetUninitializedObject(measurementType);
         var guardAfter = new byte[ScanWindow];
 
         // Reused snapshot buffers: allocating a fresh 16 KiB array per field
@@ -506,6 +546,23 @@ internal static class Program
         return result;
     }
 
+    private static bool CanInstantiate(Type type)
+    {
+        if (type.IsInterface || type.ContainsGenericParameters)
+            return false;
+
+        try
+        {
+            // works for abstract classes too — only truly unlayoutable types throw
+            RuntimeHelpers.GetUninitializedObject(type);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static FieldInfo? FindField(Type type, string name)
     {
         for (var t = type; t != null && t != typeof(object); t = t.BaseType)
@@ -529,7 +586,73 @@ internal static class Program
             return Array.CreateInstance(ft.GetElementType() ?? typeof(object), 0);
 
         // classes incl. abstract — no constructor runs
-        return RuntimeHelpers.GetUninitializedObject(ft);
+        if (!ft.IsInterface)
+        {
+            try
+            {
+                return RuntimeHelpers.GetUninitializedObject(ft);
+            }
+            catch
+            {
+                // layout not realizable in this context — fall through to a substitute
+            }
+        }
+
+        // Interfaces (IAPIProvider, IFramedClock, ...) and uninstantiable types:
+        // use a concrete implementation from the loaded assemblies instead.
+        // It is assignment-compatible for FieldInfo.SetValue and its address is
+        // just as unique for the pointer search.
+        var substitute = FindSubstitute(ft);
+        if (substitute != null)
+            return RuntimeHelpers.GetUninitializedObject(substitute);
+
+        throw new InvalidOperationException(
+            $"no instantiable substitute loaded for {ft.FullName}");
+    }
+
+    /// <summary>
+    /// Finds a concrete, instantiable type assignable to <paramref name="ft"/>.
+    /// The CLR lays out base-class fields identically in derived instances, so
+    /// measuring on a substitute is exact for fields declared on <paramref name="ft"/>.
+    /// </summary>
+    private static Type? FindSubstitute(Type ft)
+    {
+        if (SubstituteCache.TryGetValue(ft, out var cached))
+            return cached;
+
+        Type? best = null;
+        string wanted = ft.IsInterface && ft.Name.Length > 1 && ft.Name[0] == 'I'
+            ? ft.Name[1..]
+            : ft.Name;
+
+        foreach (var candidate in AllTypes)
+        {
+            if (candidate.IsAbstract || candidate.IsInterface || candidate.IsValueType ||
+                candidate.ContainsGenericParameters)
+                continue;
+            if (!ft.IsAssignableFrom(candidate))
+                continue;
+
+            try
+            {
+                RuntimeHelpers.GetUninitializedObject(candidate); // probe
+            }
+            catch
+            {
+                continue;
+            }
+
+            if (string.Equals(candidate.Name, wanted, StringComparison.OrdinalIgnoreCase))
+            {
+                best = candidate; // exact name match (IFoo -> Foo) wins immediately
+                break;
+            }
+
+            best ??= candidate; // otherwise keep the first working one (deterministic)
+        }
+
+        SubstituteCache[ft] = best;
+        return best;
     }
 
     private static object MakeRandomValue(Type ft, int depth)
