@@ -412,6 +412,8 @@ export class LazerInstance extends AbstractInstance {
             wLogger.info(
                 `Loaded torii offsets from %${offsetsPath}% for version %${this.version}%`
             );
+
+            this.warnMissingCriticalOffsets();
             return true;
         }
 
@@ -450,6 +452,8 @@ export class LazerInstance extends AbstractInstance {
             if (this.memory.offsets !== null) {
                 this.memory.offsets.OsuVersion = this.version;
             }
+
+            this.warnMissingCriticalOffsets();
             return true;
         }
 
@@ -478,6 +482,15 @@ export class LazerInstance extends AbstractInstance {
         );
 
         return paths;
+    }
+
+    private warnMissingCriticalOffsets() {
+        const missing = this.memory.getMissingCriticalOffsets();
+        if (missing.length === 0) return;
+
+        wLogger.error(
+            `Torii offsets are missing fields critical for the reader: ${missing.join(', ')}. Regenerate them with tools/torii-offsets and check its warning output — fields the generator couldn't find are omitted from the JSON`
+        );
     }
 
     private async fetchRemoteOffsets(

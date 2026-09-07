@@ -541,6 +541,13 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
      */
     private learnedGameBaseVtable: number = 0;
 
+    /**
+     * Why the last torii structural validation failed — surfaced in debug logs
+     * so a failing resolution says which link of the chain broke instead of
+     * dying silently inside the delta sweep.
+     */
+    private lastValidationFailure: string = '';
+
     @measureTime
     private updateGameBaseAddress() {
         const oldAddress = this.gameBaseAddress;
@@ -619,9 +626,17 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
         );
 
         if (this.isTorii) {
+            const missingCritical = this.getMissingCriticalOffsets();
+            if (missingCritical.length > 0) {
+                wLogger.error(
+                    `%${ClientType[this.game.client]}%`,
+                    `Torii offsets file is missing critical fields: ${missingCritical.join(', ')}`
+                );
+            }
+
             wLogger.error(
                 `%${ClientType[this.game.client]}%`,
-                `Torii hint: this usually means the loaded offsets do not match this exact torii build. Regenerate them with tools/torii-offsets for version %${this.game.version}% (see TORII.md)`
+                `Torii hint: this usually means the loaded offsets do not match this exact torii build. Regenerate them with tools/torii-offsets for version %${this.game.version}% (see TORII.md). With DEBUG_LOG=true the log also shows per-anchor chain diagnostics above this line`
             );
         }
     }
@@ -636,29 +651,83 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
         // ships in offsets.json, so sweep the small aligned window and let the
         // GameBase vtable check pick the correct one per client version.
         // Forked clients (torii) get a wider byte-step sweep.
+        //
+        // For forked clients we also track the deepest chain stage reached, so a
+        // failed resolution logs WHY (missing offset, unreadable pointer, failed
+        // validation) instead of dying silently in the catch below.
+        let bestStage = 0;
+        let bestDelta = 0;
+        let bestDetail = '';
+
+        const note = (stage: number, delta: number, detail: string) => {
+            if (!this.isTorii || stage <= bestStage) return;
+            bestStage = stage;
+            bestDelta = delta;
+            bestDetail = detail;
+        };
+
         for (const delta of deltas) {
             try {
                 const externalLinkOpener = this.process.readIntPtr(
                     anchor - delta
                 );
+                if (!externalLinkOpener) continue;
+                note(1, delta, 'externalLinkOpener pointer readable');
+
+                const apiOffset =
+                    this.offsets['osu.Game.Online.Chat.ExternalLinkOpener'][
+                        '<api>k__BackingField'
+                    ];
+                if (typeof apiOffset !== 'number') {
+                    note(
+                        2,
+                        delta,
+                        'offsets missing: ExternalLinkOpener.<api>k__BackingField'
+                    );
+                    continue;
+                }
 
                 const api = this.process.readIntPtr(
-                    externalLinkOpener +
-                        this.offsets['osu.Game.Online.Chat.ExternalLinkOpener'][
-                            '<api>k__BackingField'
-                        ]
+                    externalLinkOpener + apiOffset
                 );
+                if (!api) continue;
+                note(3, delta, 'APIAccess pointer readable');
+
+                const gameOffset =
+                    this.offsets['osu.Game.Online.API.APIAccess'].game;
+                if (typeof gameOffset !== 'number') {
+                    note(4, delta, 'offsets missing: APIAccess.game');
+                    continue;
+                }
 
                 const gameBaseAddress = this.process.readIntPtr(
-                    api + this.offsets['osu.Game.Online.API.APIAccess'].game
+                    api + gameOffset
+                );
+                if (!gameBaseAddress) continue;
+                note(
+                    5,
+                    delta,
+                    `gameBase candidate 0x${gameBaseAddress.toString(16)}`
                 );
 
                 if (this.checkIfGameBase(gameBaseAddress)) {
                     return gameBaseAddress;
                 }
+                note(
+                    6,
+                    delta,
+                    `validation failed: ${this.lastValidationFailure || 'unknown reason'}`
+                );
             } catch {
                 // wrong delta for this build — try the next candidate offset
             }
+        }
+
+        if (bestStage > 0) {
+            wLogger.debug(
+                `%${ClientType[this.game.client]}%`,
+                `torii anchor 0x${anchor.toString(16)}: deepest reach at delta 0x${bestDelta.toString(16)} [stage ${bestStage}/6] ${bestDetail}`
+            );
         }
 
         return null;
@@ -691,9 +760,17 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
                 return vtableValue === this.learnedGameBaseVtable;
             }
 
-            if (!vtableValue || !this.validateGameBaseStructure(address)) {
+            if (!vtableValue) {
+                this.lastValidationFailure = 'vtable value is 0';
                 return false;
             }
+
+            const invalidReason = this.validateGameBaseStructure(address);
+            if (invalidReason !== null) {
+                this.lastValidationFailure = invalidReason;
+                return false;
+            }
+            this.lastValidationFailure = '';
 
             this.learnedGameBaseVtable = vtableValue;
 
@@ -704,6 +781,7 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
 
             return true;
         } catch {
+            this.lastValidationFailure = 'vtable unreadable';
             return false;
         }
     }
@@ -718,63 +796,143 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
      * impossible. NOTE: it still relies on the offsets file being correct for
      * this build — wrong offsets make every candidate fail here, which is the
      * desired clean-failure behavior.
+     *
+     * Returns null when valid, or a human-readable reason for the rejection
+     * (surfaced in torii debug logs).
      */
-    private validateGameBaseStructure(address: number): boolean {
+    private validateGameBaseStructure(address: number): string | null {
         try {
-            const api = this.process.readIntPtr(
-                address +
-                    this.offsets['osu.Game.OsuGameBase']['<API>k__BackingField']
-            );
-            if (!api) return false;
+            const apiOffset =
+                this.offsets['osu.Game.OsuGameBase']['<API>k__BackingField'];
+            if (typeof apiOffset !== 'number')
+                return 'offsets missing: OsuGameBase.<API>k__BackingField';
+
+            const api = this.process.readIntPtr(address + apiOffset);
+            if (!api) return 'API pointer is 0';
+
+            const gameOffset =
+                this.offsets['osu.Game.Online.API.APIAccess'].game;
+            if (typeof gameOffset !== 'number')
+                return 'offsets missing: APIAccess.game';
 
             // roundtrip: the APIAccess object must reference this game base
-            const apiGame = this.process.readIntPtr(
-                api + this.offsets['osu.Game.Online.API.APIAccess'].game
-            );
-            if (apiGame !== address) return false;
+            const apiGame = this.process.readIntPtr(api + gameOffset);
+            if (apiGame !== address)
+                return `roundtrip mismatch: api->game = 0x${apiGame.toString(16)}, expected 0x${address.toString(16)}`;
+
+            const versionHashOffset =
+                this.offsets['osu.Game.OsuGameBase'][
+                    '<VersionHash>k__BackingField'
+                ];
+            if (typeof versionHashOffset !== 'number')
+                return 'offsets missing: OsuGameBase.<VersionHash>k__BackingField';
 
             // VersionHash is an MD5 hex string on every lazer-family build
             const versionHash = this.process.readSharpStringPtr(
-                address +
-                    this.offsets['osu.Game.OsuGameBase'][
-                        '<VersionHash>k__BackingField'
-                    ]
+                address + versionHashOffset
             );
             if (versionHash.length < 8 || versionHash.length > 128)
-                return false;
+                return `versionHash length ${versionHash.length} out of range (not a string?)`;
+            if (!/^[\x20-\x7e]+$/.test(versionHash))
+                return `versionHash not printable: ${JSON.stringify(versionHash.slice(0, 32))}`;
 
-            if (!/^[\x20-\x7e]+$/.test(versionHash)) return false;
+            const storageOffset =
+                this.offsets['osu.Game.OsuGameBase'][
+                    '<Storage>k__BackingField'
+                ];
+            if (typeof storageOffset !== 'number')
+                return 'offsets missing: OsuGameBase.<Storage>k__BackingField';
 
             // Storage -> WrappedStorage -> BasePath must look like a path
-            const storage = this.process.readIntPtr(
-                address +
-                    this.offsets['osu.Game.OsuGameBase'][
-                        '<Storage>k__BackingField'
-                    ]
-            );
-            if (!storage) return false;
+            const storage = this.process.readIntPtr(address + storageOffset);
+            if (!storage) return 'Storage pointer is 0';
+
+            const underlyingOffset =
+                this.offsets['osu.Game.IO.WrappedStorage'][
+                    '<UnderlyingStorage>k__BackingField'
+                ];
+            if (typeof underlyingOffset !== 'number')
+                return 'offsets missing: WrappedStorage.<UnderlyingStorage>k__BackingField';
 
             const underlyingStorage = this.process.readIntPtr(
-                storage +
-                    this.offsets['osu.Game.IO.WrappedStorage'][
-                        '<UnderlyingStorage>k__BackingField'
-                    ]
+                storage + underlyingOffset
             );
-            if (!underlyingStorage) return false;
+            if (!underlyingStorage) return 'UnderlyingStorage pointer is 0';
+
+            const basePathOffset =
+                this.offsets['osu.Framework.Platform.Storage'][
+                    '<BasePath>k__BackingField'
+                ];
+            if (typeof basePathOffset !== 'number')
+                return 'offsets missing: Storage.<BasePath>k__BackingField';
 
             const basePath = this.process.readSharpStringPtr(
-                underlyingStorage +
-                    this.offsets['osu.Framework.Platform.Storage'][
-                        '<BasePath>k__BackingField'
-                    ]
+                underlyingStorage + basePathOffset
             );
             if (!basePath.includes('/') && !basePath.includes('\\'))
-                return false;
+                return `basePath doesn't look like a path: ${JSON.stringify(basePath.slice(0, 64))}`;
 
-            return true;
-        } catch {
-            return false;
+            return null;
+        } catch (exc) {
+            return `read exception: ${(exc as Error).message}`;
         }
+    }
+
+    /**
+     * Fields the reader cannot function without. Used to detect a broken or
+     * stale offsets file up front (generated files report per-field warnings;
+     * a field the generator couldn't find simply won't be in the JSON, and
+     * every read through it would silently produce NaN addresses).
+     */
+    getMissingCriticalOffsets(): string[] {
+        const missing: string[] = [];
+        const offsets = this.offsets as unknown as Record<string, any>;
+
+        const need = (cls: string, field: string) => {
+            if (!offsets[cls] || typeof offsets[cls][field] !== 'number')
+                missing.push(`${cls}.${field}`);
+        };
+
+        // game-base resolution + validation chain
+        need('osu.Game.Online.Chat.ExternalLinkOpener', '<api>k__BackingField');
+        need('osu.Game.Online.API.APIAccess', 'game');
+        need('osu.Game.OsuGameBase', '<API>k__BackingField');
+        need('osu.Game.OsuGameBase', '<VersionHash>k__BackingField');
+        need('osu.Game.OsuGameBase', '<Storage>k__BackingField');
+        need(
+            'osu.Game.IO.WrappedStorage',
+            '<UnderlyingStorage>k__BackingField'
+        );
+        need('osu.Framework.Platform.Storage', '<BasePath>k__BackingField');
+
+        // screen navigation
+        const osuGame = offsets['osu.Game.OsuGame'];
+        if (
+            !osuGame ||
+            (typeof osuGame.ScreenStack !== 'number' &&
+                typeof osuGame['<ScreenStack>k__BackingField'] !== 'number')
+        )
+            missing.push('osu.Game.OsuGame.ScreenStack');
+        need('osu.Framework.Screens.ScreenStack', 'stack');
+
+        // main data loop essentials
+        need('osu.Desktop.OsuGameDesktop', 'AvailableMods');
+        need('osu.Desktop.OsuGameDesktop', 'SelectedMods');
+        need('osu.Desktop.OsuGameDesktop', 'Ruleset');
+        need('osu.Game.OsuGameBase', 'beatmapClock');
+        need('osu.Game.OsuGameBase', '<Beatmap>k__BackingField');
+        need('osu.Game.OsuGameBase', '<LocalConfig>k__BackingField');
+        need('osu.Game.OsuGame', '<frameworkConfig>k__BackingField');
+        need('osu.Game.OsuGame', 'osuLogo');
+        need('osu.Game.OsuGame', 'chatOverlay');
+        need('osu.Game.Beatmaps.FramedBeatmapClock', 'finalClockSource');
+        need('osu.Game.Beatmaps.FramedBeatmapClock', 'decoupledTrack');
+        need(
+            'osu.Framework.Timing.FramedClock',
+            '<CurrentTime>k__BackingField'
+        );
+
+        return missing;
     }
 
     private gameBase() {
