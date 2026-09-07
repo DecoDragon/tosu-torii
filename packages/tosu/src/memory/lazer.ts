@@ -674,17 +674,17 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
                 if (!externalLinkOpener) continue;
                 note(1, delta, 'externalLinkOpener pointer readable');
 
-                const apiOffset =
-                    this.offsets['osu.Game.Online.Chat.ExternalLinkOpener'][
-                        '<api>k__BackingField'
-                    ];
+                const openerOffsets = this.offsets[
+                    'osu.Game.Online.Chat.ExternalLinkOpener'
+                ] as Record<string, number | undefined> | undefined;
+                const apiOffset = openerOffsets?.['<api>k__BackingField'];
                 if (typeof apiOffset !== 'number') {
                     note(
                         2,
                         delta,
                         'offsets missing: ExternalLinkOpener.<api>k__BackingField'
                     );
-                    continue;
+                    break; // no delta can fix a missing offset
                 }
 
                 const api = this.process.readIntPtr(
@@ -693,11 +693,13 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
                 if (!api) continue;
                 note(3, delta, 'APIAccess pointer readable');
 
-                const gameOffset =
-                    this.offsets['osu.Game.Online.API.APIAccess'].game;
+                const apiAccessOffsets = this.offsets[
+                    'osu.Game.Online.API.APIAccess'
+                ] as Record<string, number | undefined> | undefined;
+                const gameOffset = apiAccessOffsets?.game;
                 if (typeof gameOffset !== 'number') {
                     note(4, delta, 'offsets missing: APIAccess.game');
-                    continue;
+                    break;
                 }
 
                 const gameBaseAddress = this.process.readIntPtr(
@@ -801,17 +803,27 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
      * (surfaced in torii debug logs).
      */
     private validateGameBaseStructure(address: number): string | null {
+        // Safe access: a generated offsets file may legitimately lack a class
+        // entirely, and member access on undefined would throw before the
+        // reason could be reported.
+        const offs = this.offsets as unknown as Record<
+            string,
+            Record<string, number | undefined> | undefined
+        >;
+        const need = (cls: string, field: string) => offs[cls]?.[field];
+
         try {
-            const apiOffset =
-                this.offsets['osu.Game.OsuGameBase']['<API>k__BackingField'];
+            const apiOffset = need(
+                'osu.Game.OsuGameBase',
+                '<API>k__BackingField'
+            );
             if (typeof apiOffset !== 'number')
                 return 'offsets missing: OsuGameBase.<API>k__BackingField';
 
             const api = this.process.readIntPtr(address + apiOffset);
             if (!api) return 'API pointer is 0';
 
-            const gameOffset =
-                this.offsets['osu.Game.Online.API.APIAccess'].game;
+            const gameOffset = need('osu.Game.Online.API.APIAccess', 'game');
             if (typeof gameOffset !== 'number')
                 return 'offsets missing: APIAccess.game';
 
@@ -820,10 +832,10 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
             if (apiGame !== address)
                 return `roundtrip mismatch: api->game = 0x${apiGame.toString(16)}, expected 0x${address.toString(16)}`;
 
-            const versionHashOffset =
-                this.offsets['osu.Game.OsuGameBase'][
-                    '<VersionHash>k__BackingField'
-                ];
+            const versionHashOffset = need(
+                'osu.Game.OsuGameBase',
+                '<VersionHash>k__BackingField'
+            );
             if (typeof versionHashOffset !== 'number')
                 return 'offsets missing: OsuGameBase.<VersionHash>k__BackingField';
 
@@ -836,10 +848,10 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
             if (!/^[\x20-\x7e]+$/.test(versionHash))
                 return `versionHash not printable: ${JSON.stringify(versionHash.slice(0, 32))}`;
 
-            const storageOffset =
-                this.offsets['osu.Game.OsuGameBase'][
-                    '<Storage>k__BackingField'
-                ];
+            const storageOffset = need(
+                'osu.Game.OsuGameBase',
+                '<Storage>k__BackingField'
+            );
             if (typeof storageOffset !== 'number')
                 return 'offsets missing: OsuGameBase.<Storage>k__BackingField';
 
@@ -847,10 +859,10 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
             const storage = this.process.readIntPtr(address + storageOffset);
             if (!storage) return 'Storage pointer is 0';
 
-            const underlyingOffset =
-                this.offsets['osu.Game.IO.WrappedStorage'][
-                    '<UnderlyingStorage>k__BackingField'
-                ];
+            const underlyingOffset = need(
+                'osu.Game.IO.WrappedStorage',
+                '<UnderlyingStorage>k__BackingField'
+            );
             if (typeof underlyingOffset !== 'number')
                 return 'offsets missing: WrappedStorage.<UnderlyingStorage>k__BackingField';
 
@@ -859,10 +871,10 @@ export class LazerMemory extends AbstractMemory<LazerPatternData> {
             );
             if (!underlyingStorage) return 'UnderlyingStorage pointer is 0';
 
-            const basePathOffset =
-                this.offsets['osu.Framework.Platform.Storage'][
-                    '<BasePath>k__BackingField'
-                ];
+            const basePathOffset = need(
+                'osu.Framework.Platform.Storage',
+                '<BasePath>k__BackingField'
+            );
             if (typeof basePathOffset !== 'number')
                 return 'offsets missing: Storage.<BasePath>k__BackingField';
 
