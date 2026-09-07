@@ -167,6 +167,33 @@ Other notes:
 - If torii ever renames its exe or deps.json again, update the name lists in
   `manager.ts` and `getOsuVersion()`.
 
+## Sharing your build with others
+
+One command assembles a ready-to-share zip (tosu + offsets for a torii
+install + a self-contained generator exe + recipient README):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\make-release.ps1 `
+    -ToriiPath "$env:LOCALAPPDATA\torii\current"
+# -> release\tosu-torii-<date>.zip
+```
+
+Recipients extract it, run `tosu.exe` while torii is running, and are done —
+the bundled `torii-offsets\<version>.json` is picked up automatically (tosu
+searches `<tosu folder>\torii-offsets\` next to the exe). After a torii
+update they run the bundled `torii-offsets.exe` themselves (instructions are
+in the generated README-torii.txt); no .NET SDK required.
+
+Distribute the zip directly or as a GitHub Release asset on your fork. Keep
+the `torii-support` branch pushed to GitHub — tosu is LGPL-3.0, so shipping
+binaries with the modified source publicly available is the license-friendly
+way to do it. Strip personal state before sharing anything manually:
+`config.ini`, `logs/`, `.cache/`, `static/` inside `packages/tosu/dist`.
+
+If you'd rather host offsets centrally (recipients never run the generator —
+tosu just downloads `<version>.json` from your repo on demand), that's a
+small patch to `resolveToriiOffsets`; ask for it.
+
 ## Merging upstream tosu later
 
 When pulling new upstream tosu releases into this fork, expect conflicts in:
